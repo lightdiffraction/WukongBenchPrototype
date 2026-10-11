@@ -1,3 +1,4 @@
+using System.ComponentModel;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -20,17 +21,60 @@ public static class Program
             return 2;
         }
 
+    static async Task EnsureProcessesExitedAsync(string[] procNames, TimeSpan timeout)
+    {
+        var sw = Stopwatch.StartNew();
+        Console.WriteLine("Ожидание завершения игровых процессов...");
+        while (sw.Elapsed < timeout)
+        {
+            var any = false;
+            foreach (var name in procNames)
+            {
+                try
+                {
+                    var procs = Process.GetProcessesByName(name);
+                    if (procs.Length > 0)
+                    {
+                        any = true;
+                        foreach (var p in procs)
+                        {
+                            try { if (!p.HasExited) p.Kill(); } catch { }
+                            finally { p.Dispose(); }
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine($"Ошибка при проверке процессов '{name}': {ex.Message}");
+                }
+            }
+
+            if (!any)
+            {
+                Console.WriteLine("Все игровые процессы завершены.");
+                return;
+            }
+
+            await Task.Delay(500);
+        }
+
+        Console.Error.WriteLine("Внимание: некоторые игровые процессы не завершились в отведённое время.");
+    }
+
         var install = SteamLocator.Find(cfg.BenchmarkRoot);
         Console.WriteLine($"Benchmark root: {install.Root}");
 
         var settings = Path.Combine(install.Root, @"b1\Saved\Config\Windows\GameUserSettings.ini");
-        var launcher = Path.Combine(install.Root, "b1_benchmark.exe");
+        // Prefer the actual game executable in the b1 subfolder. Keep custom install root if provided.
+        var shippingLauncher = Path.Combine(install.Root, Path.Combine("b1", "Binaries", "Win64", "b1-Win64-Shipping.exe"));
+        var legacyLauncher = Path.Combine(install.Root, "b1_benchmark.exe");
+        var launcher = File.Exists(shippingLauncher) ? shippingLauncher : legacyLauncher;
         var history = cfg.HistoryDirectory;
 
         if (!File.Exists(settings))
             throw new FileNotFoundException("GameUserSettings.ini not found.", settings);
-        if (!File.Exists(launcher))
-            throw new FileNotFoundException("b1_benchmark.exe not found.", launcher);
+        if (!File.Exists(shippingLauncher) && !File.Exists(legacyLauncher))
+            throw new FileNotFoundException("Could not find the benchmark/game executable.");
         Directory.CreateDirectory(history);
 
         var original = File.ReadAllText(settings, Encoding.UTF8);
@@ -58,6 +102,12 @@ public static class Program
             }
 
             var cpu = await RunPassAsync("CPU", cpuProfile, settings, launcher, history, runDir, cfg);
+
+            // Убедимся, что все процессы игры/лаунчера завершились перед вторым прогоном (GPU).
+            // Иногда лаунчер или игра (b1-Win64-Shipping, b1-benchmark, BootstrapPackagedGame) остаются активными
+            // и мешают запуску следующего прогона с ошибкой "game is already running".
+            await EnsureProcessesExitedAsync(new[] { "b1-Win64-Shipping", "b1-benchmark", "BootstrapPackagedGame" }, TimeSpan.FromSeconds(30));
+
             var gpu = await RunPassAsync("GPU", gpuProfile, settings, launcher, history, runDir, cfg);
 
             var report = Report.Build(cpu, gpu, runDir);
@@ -125,11 +175,23 @@ public static class Program
                     p.WaitForExit(5000);
                 }
             }
-            catch { }
+            catch (InvalidOperationException)
+            {
+                // Процесс уже завершился между HasExited и Kill.
+            }
+            catch (Win32Exception ex)
+            {
+                Console.Error.WriteLine($"Не удалось завершить процесс {p.Id}: {ex.Message}");
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"Непредвиденная ошибка при завершении процесса {p.Id}: {ex}");
+            }
+            finally { p.Dispose(); }
 
-            // Иногда сам лаунчер порождает отдельный процесс игры (b1-Win64-Shipping или b1-benchmark).
-            // Убедимся, что они тоже завершены перед следующим прогоном.
-            foreach (var procName in new[] { "b1-Win64-Shipping", "b1-benchmark" })
+            // Лаунчер порождает отдельный процесс игры (b1-Win64-Shipping или b1-benchmark).
+            // Убедимся, что они тоже завершены перед следующим прогоном, иначе будет ошибка game is already running.
+            foreach (var procName in new[] { "b1-Win64-Shipping", "b1-benchmark", "BootstrapPackagedGame" })
             {
                 try
                 {
@@ -144,14 +206,33 @@ public static class Program
                                 gp.WaitForExit(5000);
                             }
                         }
-                        catch { }
+                        catch (InvalidOperationException)
+                        {
+                            // Процесс уже помер между HasExited и Kill.
+                        }
+                        catch (Win32Exception ex)
+                        {
+                            Console.Error.WriteLine($"Не удалось убить {gp.ProcessName} ({gp.Id}): {ex.Message}");
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.Error.WriteLine($"Ошибка при убийстве {gp.ProcessName} ({gp.Id}): {ex}");
+                        }
+                        finally { gp.Dispose(); }
                     }
                 }
-                catch { }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine($"Не удалось получить список процессов '{procName}': {ex.Message}");
+                    continue;
+                }
             }
 
         }
-        catch { }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"Ошибка при завершении процессов бенчмарка: {ex}");
+        }
 
         return new PassResult(name, profile, result, resultFile);
     }
@@ -214,6 +295,16 @@ public sealed record AppConfig
                     cfg = cfg with { ConfirmButtonXPx = px, ConfirmButtonYPx = py };
                 }
             }
+            if (a.StartsWith("--history-dir=", StringComparison.OrdinalIgnoreCase))
+            {
+                var v = a.Split('=', 2)[1];
+                if (!string.IsNullOrWhiteSpace(v)) cfg = cfg with { HistoryDirectory = v };
+            }
+            if (a.StartsWith("--output-dir=", StringComparison.OrdinalIgnoreCase))
+            {
+                var v = a.Split('=', 2)[1];
+                if (!string.IsNullOrWhiteSpace(v)) cfg = cfg with { OutputDirectory = v };
+            }
         }
 
         return cfg;
@@ -238,7 +329,10 @@ public static class SteamLocator
             if (!string.IsNullOrWhiteSpace(steam))
                 candidates.Add(steam);
         }
-        catch { }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"Ошибка при поиске установки Steam: {ex.Message}");
+        }
 
         foreach (var steam in candidates.ToArray())
         {
@@ -255,7 +349,10 @@ public static class SteamLocator
         foreach (var library in candidates.Distinct())
         {
             var root = Path.Combine(library, "steamapps", "common", "Black Myth Wukong Benchmark Tool");
-            if (File.Exists(Path.Combine(root, "b1_benchmark.exe")))
+            // Prefer the game's shipping executable under b1\Binaries\Win64, but accept the legacy b1_benchmark.exe if present.
+            var shipping = Path.Combine(root, "b1", "Binaries", "Win64", "b1-Win64-Shipping.exe");
+            var legacy = Path.Combine(root, "b1_benchmark.exe");
+            if (File.Exists(shipping) || File.Exists(legacy))
                 return new InstallInfo(root);
         }
 
@@ -266,8 +363,10 @@ public static class SteamLocator
     static InstallInfo Validate(string root)
     {
         root = Path.GetFullPath(root);
-        if (!File.Exists(Path.Combine(root, "b1_benchmark.exe")))
-            throw new FileNotFoundException("b1_benchmark.exe not found under supplied benchmark root.");
+        var shipping = Path.Combine(root, "b1", "Binaries", "Win64", "b1-Win64-Shipping.exe");
+        var legacy = Path.Combine(root, "b1_benchmark.exe");
+        if (!File.Exists(shipping) && !File.Exists(legacy))
+            throw new FileNotFoundException("Could not find benchmark/game executable under supplied benchmark root.");
         return new InstallInfo(root);
     }
 }
@@ -526,7 +625,10 @@ public static class ResultWatcher
                     if (doc.RootElement.TryGetProperty("FPSAvg", out _))
                         return f.FullName;
                 }
-                catch { }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine($"Ошибка при чтении JSON файла {f.FullName}: {ex.Message}");
+                }
             }
 
             await Task.Delay(1000);
@@ -722,8 +824,8 @@ public static class UiAutomation
         await Task.Delay(3000);
 
         // Поскольку GUI прогружается не сразу и обратной связи нет,
-        // выполняем серию попыток (до 5) через каждую минуту, начиная сразу.
-        const int maxAttempts = 7;
+        // выполняем серию попыток (до 20) раз в 0.1 минуты, начиная сразу.
+        const int maxAttempts = 20;
         var interval = TimeSpan.FromMinutes(0.1);
 
         for (int attempt = 1; attempt <= maxAttempts; attempt++)
@@ -762,7 +864,7 @@ public static class UiAutomation
                 Console.WriteLine($"UI attempt {attempt}/{maxAttempts}: clicking first button at ({x1},{y1}).");
                 ClickAbsolute(x1, y1);
 
-                await Task.Delay(1000);
+                await Task.Delay(2000);
 
                 Console.WriteLine($"UI attempt {attempt}/{maxAttempts}: clicking second button at ({x2},{y2}).");
                 ClickAbsolute(x2, y2);
@@ -835,7 +937,7 @@ public static class UiAutomation
     static int GetScreenWidth() => GetSystemMetrics(0);
     static int GetScreenHeight() => GetSystemMetrics(1);
 }
- 
+
 public static class Report
 {
     public static string Build(PassResult cpu, PassResult gpu, string dir)

@@ -54,7 +54,10 @@ dotnet run -- "C:\Program Files (x86)\Steam\steamapps\common\Black Myth Wukong B
 
 ## Аргументы командной строки
 
-Программа поддерживает указание пути к каталогу бенчмарка (BenchmarkRoot) как позиционный аргумент — это путь к папке с `b1_benchmark.exe`:
+Программа поддерживает указание пути к каталогу бенчмарка (BenchmarkRoot) как позиционный аргумент — это путь к папке с бенчмарком. Поддерживаются оба варианта запуска:
+
+- старый лончер: `b1_benchmark.exe` в корне папки;
+- основной исполняемый файл игры: `b1\Binaries\Win64\b1-Win64-Shipping.exe`.
 
 ```powershell
 dotnet run -- "C:\Program Files (x86)\Steam\steamapps\common\Black Myth Wukong Benchmark Tool"
