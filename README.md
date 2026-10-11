@@ -1,11 +1,11 @@
 # WukongBenchPrototype
 
-Прототип решения задания на C#/.NET 8 для автоматизации Black Myth: Wukong Benchmark Tool.
+Решение задания на C#/.NET 8 для автоматизации Black Myth: Wukong Benchmark Tool.
 
-## Что учитывает этот прототип
+## Что учитывает это решение
 
-- результат — файл в `%TEMP%\b1\BenchMarkHistory\Tool`;
-- в корне есть `FPSAvg`, `FPSMax`, `FPSMin`, `FPS95`, `CPUAvg`, `GPUAvg`;
+- результат — файл в `%TEMP%\b1\BenchMarkHistory\Tool` (без разрешения, но его можно распарсить как json);
+- в корне результата есть `FPSAvg`, `FPSMax`, `FPSMin`, `FPS95`, `CPUAvg`, `GPUAvg`;
 - есть модель CPU/GPU, версия драйвера, RAM, разрешение и применённые настройки;
 - есть `Records[]` с `FrameRate`, `CPUUsage`, `GPUUsage`, `CPUFrameTime`, `GPUFrameTime`;
 - папка результатов по умолчанию: `%TEMP%\b1\BenchMarkHistory\Tool`;
@@ -23,7 +23,7 @@
 - VSync off
 - FPS limit off
 
-Идея: резко уменьшить работу GPU, чтобы CPU стал главным ограничителем.
+Идея: уменьшить работу GPU минимальными растройками, чтобы CPU стал главным ограничителем.
 
 ### GPU
 - текущая/native resolution из исходного INI (но не ниже 1920x1080)

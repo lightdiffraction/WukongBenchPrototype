@@ -251,13 +251,12 @@ public sealed record AppConfig
     public bool PrepareOnly { get; init; }
     public bool SkipUiAutomation { get; init; }
 
-    // Normalized coordinates in the benchmark window (0..1).
-    // These are deliberately configurable because Unreal UI layout can differ.
+    // Нормализованные координаты в окне бенчмарка
     public double BenchmarkButtonX { get; init; } = 0.50;
     public double BenchmarkButtonY { get; init; } = 0.57;
     public double ConfirmButtonX { get; init; } = 0.50;
     public double ConfirmButtonY { get; init; } = 0.74;
-    // Optional pixel coordinates (screen space). If present, these take precedence over normalized coords.
+    // Возможные пиксельные координаты, если пользователь хочет их переопределить.
     public int? BenchmarkButtonXPx { get; init; }
     public int? BenchmarkButtonYPx { get; init; }
     public int? ConfirmButtonXPx { get; init; }
@@ -274,7 +273,7 @@ public sealed record AppConfig
             SkipUiAutomation = args.Contains("--manual")
         };
 
-        // Parse optional pixel coordinates from args in the form --benchmark-button-px=X,Y and --confirm-button-px=X,Y
+        // Распарсить дополнительные пиксельные координаты из аргументов в формате --benchmark-button-px=X,Y и --confirm-button-px=X,Y
         foreach (var a in args)
         {
             if (a.StartsWith("--benchmark-button-px=", StringComparison.OrdinalIgnoreCase))
@@ -349,7 +348,7 @@ public static class SteamLocator
         foreach (var library in candidates.Distinct())
         {
             var root = Path.Combine(library, "steamapps", "common", "Black Myth Wukong Benchmark Tool");
-            // Prefer the game's shipping executable under b1\Binaries\Win64, but accept the legacy b1_benchmark.exe if present.
+            // В первую очередь использовать shipping executable under b1\Binaries\Win64, но принимать legacy b1_benchmark.exe, если он присутствует.
             var shipping = Path.Combine(root, "b1", "Binaries", "Win64", "b1-Win64-Shipping.exe");
             var legacy = Path.Combine(root, "b1_benchmark.exe");
             if (File.Exists(shipping) || File.Exists(legacy))
@@ -431,7 +430,7 @@ public static class Profiles
     {
         var x = source.Clone();
 
-        // Use the user's current/native resolution as the heavy-test resolution.
+        // Использовать разрешение экрана пользователя или 1920x1080, если меньше.
         int w = source.Int("ResolutionSizeX", 1920);
         int h = source.Int("ResolutionSizeY", 1080);
         if (w < 1920 || h < 1080) { w = 1920; h = 1080; }
