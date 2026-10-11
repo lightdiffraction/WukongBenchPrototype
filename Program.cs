@@ -79,8 +79,10 @@ public static class Program
         Console.WriteLine($"\n=== {name} PASS ===");
         File.WriteAllText(settings, profile.IniText, Encoding.UTF8);
 
-        var before = Directory.GetFiles(history, "*.json")
+        var before = Directory.GetFiles(history, "*")
             .ToDictionary(x => x, x => File.GetLastWriteTimeUtc(x));
+
+        var startUtc = DateTime.UtcNow;
 
         using var p = Process.Start(new ProcessStartInfo
         {
@@ -101,7 +103,7 @@ public static class Program
         }
 
         var resultFile = await ResultWatcher.WaitForNewJsonAsync(
-            history, before, TimeSpan.FromMinutes(cfg.TimeoutMinutes));
+            history, before, TimeSpan.FromMinutes(cfg.TimeoutMinutes), startUtc);
 
         var json = await File.ReadAllTextAsync(resultFile);
         var result = JsonSerializer.Deserialize<BenchmarkResult>(json)
@@ -114,7 +116,40 @@ public static class Program
 
         try
         {
-            if (!p.HasExited) p.Kill(true);
+            // Попытаемся корректно завершить запущенные процессы бенчмарка.
+            try
+            {
+                if (!p.HasExited)
+                {
+                    p.Kill(entireProcessTree: true);
+                    p.WaitForExit(5000);
+                }
+            }
+            catch { }
+
+            // Иногда сам лаунчер порождает отдельный процесс игры (b1-Win64-Shipping или b1-benchmark).
+            // Убедимся, что они тоже завершены перед следующим прогоном.
+            foreach (var procName in new[] { "b1-Win64-Shipping", "b1-benchmark" })
+            {
+                try
+                {
+                    var procs = Process.GetProcessesByName(procName);
+                    foreach (var gp in procs)
+                    {
+                        try
+                        {
+                            if (!gp.HasExited)
+                            {
+                                gp.Kill();
+                                gp.WaitForExit(5000);
+                            }
+                        }
+                        catch { }
+                    }
+                }
+                catch { }
+            }
+
         }
         catch { }
 
@@ -124,7 +159,7 @@ public static class Program
 
 public sealed record PassResult(string Name, Profile Profile, BenchmarkResult Result, string SourceFile);
 
-public sealed class AppConfig
+public sealed record AppConfig
 {
     public string? BenchmarkRootArg { get; init; }
     public string HistoryDirectory { get; init; } =
@@ -141,17 +176,47 @@ public sealed class AppConfig
     public double BenchmarkButtonY { get; init; } = 0.57;
     public double ConfirmButtonX { get; init; } = 0.50;
     public double ConfirmButtonY { get; init; } = 0.74;
+    // Optional pixel coordinates (screen space). If present, these take precedence over normalized coords.
+    public int? BenchmarkButtonXPx { get; init; }
+    public int? BenchmarkButtonYPx { get; init; }
+    public int? ConfirmButtonXPx { get; init; }
+    public int? ConfirmButtonYPx { get; init; }
     public string? BenchmarkRoot { get; internal set; }
 
     public static AppConfig Load(string[] args)
     {
         string? root = args.Length > 0 && !args[0].StartsWith("--") ? args[0] : null;
-        return new AppConfig
+        var cfg = new AppConfig
         {
             BenchmarkRootArg = root,
             PrepareOnly = args.Contains("--prepare-only"),
             SkipUiAutomation = args.Contains("--manual")
         };
+
+        // Parse optional pixel coordinates from args in the form --benchmark-button-px=X,Y and --confirm-button-px=X,Y
+        foreach (var a in args)
+        {
+            if (a.StartsWith("--benchmark-button-px=", StringComparison.OrdinalIgnoreCase))
+            {
+                var v = a.Split('=', 2)[1];
+                var parts = v.Split(',', StringSplitOptions.RemoveEmptyEntries);
+                if (parts.Length >= 2 && int.TryParse(parts[0], out var px) && int.TryParse(parts[1], out var py))
+                {
+                    cfg = cfg with { BenchmarkButtonXPx = px, BenchmarkButtonYPx = py };
+                }
+            }
+            if (a.StartsWith("--confirm-button-px=", StringComparison.OrdinalIgnoreCase))
+            {
+                var v = a.Split('=', 2)[1];
+                var parts = v.Split(',', StringSplitOptions.RemoveEmptyEntries);
+                if (parts.Length >= 2 && int.TryParse(parts[0], out var px) && int.TryParse(parts[1], out var py))
+                {
+                    cfg = cfg with { ConfirmButtonXPx = px, ConfirmButtonYPx = py };
+                }
+            }
+        }
+
+        return cfg;
     }
 }
 
@@ -435,14 +500,20 @@ public sealed class FrameRecord
 public static class ResultWatcher
 {
     public static async Task<string> WaitForNewJsonAsync(
-        string directory, Dictionary<string, DateTime> before, TimeSpan timeout)
+        string directory, Dictionary<string, DateTime> before, TimeSpan timeout, DateTime? startUtc = null)
     {
         var sw = Stopwatch.StartNew();
         while (sw.Elapsed < timeout)
         {
-            var files = Directory.GetFiles(directory, "*.json")
+            var files = Directory.GetFiles(directory, "*")
                 .Select(p => new FileInfo(p))
-                .Where(f => !before.TryGetValue(f.FullName, out var old) || f.LastWriteTimeUtc > old)
+                .Where(f =>
+                {
+                    if (!before.TryGetValue(f.FullName, out var old)) return true;
+                    if (f.LastWriteTimeUtc > old) return true;
+                    if (startUtc.HasValue && f.LastWriteTimeUtc > startUtc.Value) return true;
+                    return false;
+                })
                 .OrderByDescending(f => f.LastWriteTimeUtc)
                 .ToList();
 
@@ -498,38 +569,218 @@ public static class UiAutomation
     [StructLayout(LayoutKind.Sequential)]
     struct KEYBDINPUT { public ushort wVk, wScan; public uint dwFlags, time; public IntPtr dwExtraInfo; }
 
-    public static async Task WaitAndStartBenchmarkAsync(int launcherPid, AppConfig cfg)
+
+    private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    private static extern bool EnumWindows(
+        EnumWindowsProc callback, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    private static extern bool IsWindowVisible(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(
+        IntPtr hWnd, out uint processId);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern int GetWindowText(
+        IntPtr hWnd, StringBuilder text, int maxCount);
+
+    [DllImport("user32.dll")]
+    private static extern int GetWindowTextLength(IntPtr hWnd);
+
+    private static IntPtr FindVisibleWindow(int targetPid)
     {
-        Process? game = null;
-        for (int i = 0; i < 120 && game == null; i++)
+        IntPtr found = IntPtr.Zero;
+
+        EnumWindows((hWnd, _) =>
         {
-            game = Process.GetProcessesByName("b1-Win64-Shipping").FirstOrDefault();
-            if (game == null) await Task.Delay(1000);
-        }
+            GetWindowThreadProcessId(hWnd, out uint pid);
 
-        if (game == null)
-            throw new TimeoutException("b1-Win64-Shipping window did not appear.");
+            if (pid != (uint)targetPid)
+                return true;
 
-        for (int i = 0; i < 60 && game.MainWindowHandle == IntPtr.Zero; i++)
-            await Task.Delay(500);
+            if (!IsWindowVisible(hWnd))
+                return true;
 
-        if (game.MainWindowHandle == IntPtr.Zero)
-            throw new InvalidOperationException("Benchmark window was found, but it has no main window.");
+            // Не берём окна без заголовка.
+            if (GetWindowTextLength(hWnd) == 0)
+                return true;
 
-        SetForegroundWindow(game.MainWindowHandle);
-        await Task.Delay(5000);
+            found = hWnd;
+            return false; // Нашли первое подходящее окно.
+        }, IntPtr.Zero);
 
-        // First Enter dismisses/advances the startup screen.
-        Key(VK_RETURN);
-        await Task.Delay(2500);
-
-        ClickNormalized(game.MainWindowHandle, cfg.BenchmarkButtonX, cfg.BenchmarkButtonY);
-        await Task.Delay(1200);
-        ClickNormalized(game.MainWindowHandle, cfg.ConfirmButtonX, cfg.ConfirmButtonY);
-
-        Console.WriteLine("UI automation sent: startup -> Benchmark -> Confirm.");
+        return found;
     }
 
+    private static string GetWindowTitle(IntPtr hWnd)
+    {
+        var text = new StringBuilder(512);
+        GetWindowText(hWnd, text, text.Capacity);
+        return text.ToString();
+    }
+
+    private static void DumpBenchmarkWindows()
+    {
+        Console.WriteLine("Видимые окна процессов Benchmark Tool:");
+
+        EnumWindows((hWnd, _) =>
+        {
+            if (!IsWindowVisible(hWnd))
+                return true;
+
+            GetWindowThreadProcessId(hWnd, out uint pid);
+
+            string processName;
+            try
+            {
+                using var p = Process.GetProcessById((int)pid);
+                processName = p.ProcessName;
+            }
+            catch
+            {
+                processName = "?";
+            }
+
+            string title = GetWindowTitle(hWnd);
+
+            if (processName.Contains("b1",
+                    StringComparison.OrdinalIgnoreCase)
+                || title.Contains("b1",
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                Console.WriteLine(
+                    $"PID={pid}, Process={processName}, " +
+                    $"Title='{title}', HWND={hWnd}");
+            }
+
+            return true;
+        }, IntPtr.Zero);
+    }
+
+    public static async Task WaitAndStartBenchmarkAsync(
+        int launcherPid, AppConfig cfg)
+    {
+        Process? game = null;
+        IntPtr hwnd = IntPtr.Zero;
+
+        // Ищем процессы, пока у одного из них не появится видимое окно.
+        for (int i = 0; i < 120; i++)
+        {
+            var processes = Process.GetProcesses()
+                .Where(p =>
+                {
+                    try
+                    {
+                        return p.ProcessName.Equals(
+                                   "b1-Win64-Shipping",
+                                   StringComparison.OrdinalIgnoreCase)
+                               || p.ProcessName.Equals(
+                                   "b1-benchmark",
+                                   StringComparison.OrdinalIgnoreCase);
+                    }
+                    catch
+                    {
+                        return false;
+                    }
+                })
+                .ToList();
+
+            foreach (var process in processes)
+            {
+                hwnd = FindVisibleWindow(process.Id);
+
+                if (hwnd != IntPtr.Zero)
+                {
+                    game = process;
+                    break;
+                }
+            }
+
+            if (hwnd != IntPtr.Zero)
+                break;
+
+            await Task.Delay(1000);
+        }
+
+        if (game == null || hwnd == IntPtr.Zero)
+        {
+            Console.WriteLine("Не удалось найти видимое окно.");
+            DumpBenchmarkWindows();
+            throw new InvalidOperationException(
+                "Benchmark process found, but no visible top-level window was found.");
+        }
+
+        Console.WriteLine(
+            $"Окно найдено: PID={game.Id}, " +
+            $"Process={game.ProcessName}, " +
+            $"Title='{GetWindowTitle(hwnd)}', HWND={hwnd}");
+
+        SetForegroundWindow(hwnd);
+        await Task.Delay(3000);
+
+        // Поскольку GUI прогружается не сразу и обратной связи нет,
+        // выполняем серию попыток (до 5) через каждую минуту, начиная сразу.
+        const int maxAttempts = 7;
+        var interval = TimeSpan.FromMinutes(0.1);
+
+        for (int attempt = 1; attempt <= maxAttempts; attempt++)
+        {
+            try
+            {
+                if (game == null || game.HasExited)
+                {
+                    Console.WriteLine("Benchmark process exited before UI interaction.");
+                    break;
+                }
+
+                Console.WriteLine($"UI attempt {attempt}/{maxAttempts}: sending wake key (Enter).");
+                // Ставим окно на передний план и посылаем Enter, чтобы пробудить UI.
+                SetForegroundWindow(hwnd);
+                Key(0x0D);
+
+                // Ждём, чтобы интерфейс отреагировал.
+                await Task.Delay(5000);
+
+                // Вычисляем координаты по формуле и кликаем на пиксель.
+                int W = GetScreenWidth();
+                int H = GetScreenHeight();
+                double R = 16.0 / 9.0;
+                double Wi = Math.Min(W, H * R);
+                double Hi = Wi / R;
+                double left = (W - Wi) / 2.0;
+                double top = (H - Hi) / 2.0;
+                double scale = Wi / 3120.0;
+
+                int x1 = (int)Math.Round(left + 361 * scale);
+                int y1 = (int)Math.Round(top + 794 * scale);
+                int x2 = (int)Math.Round(left + 1243 * scale);
+                int y2 = (int)Math.Round(top + 1040 * scale);
+
+                Console.WriteLine($"UI attempt {attempt}/{maxAttempts}: clicking first button at ({x1},{y1}).");
+                ClickAbsolute(x1, y1);
+
+                await Task.Delay(1000);
+
+                Console.WriteLine($"UI attempt {attempt}/{maxAttempts}: clicking second button at ({x2},{y2}).");
+                ClickAbsolute(x2, y2);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"UI attempt {attempt} failed: {ex.Message}");
+            }
+
+            if (attempt < maxAttempts)
+            {
+                Console.WriteLine($"Ожидание {interval.TotalMinutes} минуты перед следующей попыткой...");
+                await Task.Delay(interval);
+            }
+        }
+
+        Console.WriteLine("Отправлены команды запуска Benchmark.");
+    }
     static void Key(ushort vk)
     {
         var input = new INPUT
@@ -563,11 +814,28 @@ public static class UiAutomation
         SendInput(2, new[] { down, up }, Marshal.SizeOf<INPUT>());
     }
 
+    static void ClickAbsolute(int sx, int sy)
+    {
+        // sx, sy — экранные координаты в пикселях
+        int vx = (int)Math.Round(sx * 65535.0 / (GetScreenWidth() - 1));
+        int vy = (int)Math.Round(sy * 65535.0 / (GetScreenHeight() - 1));
+
+        var down = new INPUT
+        {
+            type = INPUT_MOUSE,
+            U = new INPUTUNION { mi = new MOUSEINPUT { dx = vx, dy = vy, dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_LEFTDOWN } }
+        };
+        var up = down;
+        up.U.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_LEFTUP;
+
+        SendInput(2, new[] { down, up }, Marshal.SizeOf<INPUT>());
+    }
+
     [DllImport("user32.dll")] static extern int GetSystemMetrics(int nIndex);
     static int GetScreenWidth() => GetSystemMetrics(0);
     static int GetScreenHeight() => GetSystemMetrics(1);
 }
-
+ 
 public static class Report
 {
     public static string Build(PassResult cpu, PassResult gpu, string dir)
